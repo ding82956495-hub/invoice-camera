@@ -1,0 +1,662 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="UTF-8">
+
+  <meta
+    name="viewport"
+    content="width=device-width, initial-scale=1, viewport-fit=cover"
+  >
+
+  <meta name="referrer" content="no-referrer">
+
+  <title>發票即時掃描</title>
+
+  <style>
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      background: #101b1e;
+      color: white;
+      font: 16px system-ui, sans-serif;
+    }
+
+    header {
+      padding: 18px;
+      background: white;
+      color: #153d40;
+      text-align: center;
+      font-size: 21px;
+      font-weight: bold;
+    }
+
+    .camera {
+      position: relative;
+      height: 62vh;
+      min-height: 300px;
+      overflow: hidden;
+      background: black;
+    }
+
+    video {
+      width: 100%;
+      height: 100%;
+      object-fit: contain;
+    }
+
+    .overlay {
+      position: absolute;
+      inset: 0;
+      display: grid;
+      place-items: center;
+      pointer-events: none;
+    }
+
+    .frame {
+      position: relative;
+      width: min(64vw, 280px);
+      aspect-ratio: 1;
+      border: 4px solid #27dfcc;
+      border-radius: 22px;
+      box-shadow:
+        0 0 0 100vmax rgba(0, 0, 0, .18);
+    }
+
+    .line {
+      position: absolute;
+      left: 8%;
+      right: 8%;
+      height: 2px;
+      background: #27dfcc;
+      animation:
+        scan 2s ease-in-out infinite alternate;
+    }
+
+    @keyframes scan {
+      from { top: 12%; }
+      to { top: 88%; }
+    }
+
+    .panel {
+      max-width: 600px;
+      margin: auto;
+      padding: 18px;
+    }
+
+    button,
+    textarea {
+      width: 100%;
+      padding: 14px;
+      margin-bottom: 12px;
+      border: 0;
+      border-radius: 12px;
+      font: inherit;
+    }
+
+    button {
+      background: #00a89d;
+      color: white;
+      cursor: pointer;
+    }
+
+    button.secondary {
+      background: #344b50;
+    }
+
+    button:disabled {
+      opacity: .5;
+    }
+
+    #status {
+      line-height: 1.7;
+      white-space: pre-wrap;
+    }
+
+    .hint {
+      color: #bed1d3;
+      font-size: 14px;
+      line-height: 1.7;
+    }
+
+    #fallback {
+      display: none;
+    }
+
+    textarea {
+      min-height: 100px;
+      color: #172f35;
+      background: white;
+      overflow-wrap: anywhere;
+    }
+  </style>
+</head>
+
+<body>
+<header>發票即時掃描</header>
+
+<div class="camera">
+  <video
+    id="video"
+    autoplay
+    muted
+    playsinline
+  ></video>
+
+  <div class="overlay">
+    <div class="frame">
+      <div class="line"></div>
+    </div>
+  </div>
+</div>
+
+<div class="panel">
+  <button id="start" type="button">
+    開啟後鏡頭
+  </button>
+
+  <button
+    id="stop"
+    type="button"
+    class="secondary"
+    disabled
+  >
+    停止相機
+  </button>
+
+  <p id="status" role="status" aria-live="polite">
+    按「開啟後鏡頭」，並允許使用相機。
+  </p>
+
+  <div id="fallback">
+    <button id="resend" type="button">
+      重新傳回資料頁
+    </button>
+
+    <p class="hint">
+      若無法自動回填，可複製以下文字，
+      回原頁展開「貼上 QR 原始文字」後貼上解析。
+    </p>
+
+    <textarea
+      id="result"
+      readonly
+      aria-label="QR 辨識結果"
+    ></textarea>
+
+    <button
+      id="copy"
+      type="button"
+      class="secondary"
+    >
+      複製 QR 內容
+    </button>
+  </div>
+
+  <p class="hint">
+    請對準發票左側 QR，保留完整白邊，
+    避免反光，等待相機對焦清楚。
+    相機畫面只在本機辨識，不會上傳。
+    本頁不提供發票對獎。
+  </p>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.js"></script>
+
+<script>
+'use strict';
+
+const $ = id => document.getElementById(id);
+const video = $('video');
+
+const params = new URLSearchParams(
+  window.location.hash.slice(1)
+);
+
+const parentOrigin = params.get('parentOrigin');
+const token = params.get('token');
+
+const canvas = document.createElement('canvas');
+
+const context = canvas.getContext('2d', {
+  willReadFrequently: true
+});
+
+let stream = null;
+let running = false;
+let starting = false;
+
+let timer = null;
+let ackTimer = null;
+
+let attempt = 0;
+let pendingRaw = '';
+let session = 0;
+
+function show(message) {
+  $('status').textContent = message;
+}
+
+function validParent() {
+  try {
+    const url = new URL(parentOrigin);
+
+    return (
+      url.protocol === 'https:' &&
+      (
+        url.hostname === 'script.google.com' ||
+        url.hostname === 'script.googleusercontent.com' ||
+        url.hostname.endsWith(
+          '.script.googleusercontent.com'
+        )
+      )
+    );
+  } catch (error) {
+    return false;
+  }
+}
+
+function stopCamera() {
+  session++;
+  running = false;
+
+  clearTimeout(timer);
+  timer = null;
+
+  if (stream) {
+    stream.getTracks().forEach(track => {
+      track.stop();
+    });
+
+    stream = null;
+  }
+
+  video.srcObject = null;
+
+  $('start').disabled = starting;
+  $('stop').disabled = true;
+}
+
+function isInvoiceQR(raw) {
+  if (
+    typeof raw !== 'string' ||
+    raw.length < 77 ||
+    raw.length > 12000 ||
+    !/^[A-Za-z]{2}\d{8}\d{7}\d{4}[0-9a-fA-F]{16}\d{16}/.test(raw)
+  ) {
+    return false;
+  }
+
+  const dateText =
+    (Number(raw.slice(10, 13)) + 1911) + '-' +
+    raw.slice(13, 15) + '-' +
+    raw.slice(15, 17);
+
+  const date = new Date(
+    dateText + 'T00:00:00Z'
+  );
+
+  return (
+    !isNaN(date.getTime()) &&
+    date.toISOString().slice(0, 10) === dateText
+  );
+}
+
+function decodeRegion(region) {
+  const [left, top, width, height] = region;
+
+  const vw = video.videoWidth;
+  const vh = video.videoHeight;
+
+  const sx = Math.round(left * vw);
+  const sy = Math.round(top * vh);
+
+  const sw = Math.min(
+    vw - sx,
+    Math.round(width * vw)
+  );
+
+  const sh = Math.min(
+    vh - sy,
+    Math.round(height * vh)
+  );
+
+  const scale = Math.min(
+    2,
+    1100 / Math.max(sw, sh)
+  );
+
+  canvas.width = Math.max(
+    1,
+    Math.round(sw * scale)
+  );
+
+  canvas.height = Math.max(
+    1,
+    Math.round(sh * scale)
+  );
+
+  context.drawImage(
+    video,
+    sx, sy, sw, sh,
+    0, 0, canvas.width, canvas.height
+  );
+
+  const pixels = context.getImageData(
+    0, 0, canvas.width, canvas.height
+  );
+
+  return jsQR(
+    pixels.data,
+    pixels.width,
+    pixels.height,
+    { inversionAttempts: 'attemptBoth' }
+  );
+}
+
+function sendResult() {
+  if (!pendingRaw) {
+    return;
+  }
+
+  clearTimeout(ackTimer);
+
+  if (
+    !validParent() ||
+    !token ||
+    !window.opener ||
+    window.opener.closed
+  ) {
+    show(
+      '已讀到 QR，但無法自動回傳。\n' +
+      '請複製下方內容，回原頁貼上解析。'
+    );
+
+    return;
+  }
+
+  show('已讀到 QR，正在傳回資料頁……');
+
+  window.opener.postMessage(
+    {
+      type: 'TAIWAN_INVOICE_QR',
+      token: token,
+      raw: pendingRaw
+    },
+    parentOrigin
+  );
+
+  ackTimer = setTimeout(function () {
+    show(
+      '尚未收到資料頁確認。\n' +
+      '請切回原頁檢查，或按「重新傳回資料頁」。\n' +
+      '也可複製 QR 內容回原頁解析。'
+    );
+  }, 6000);
+}
+
+function found(raw) {
+  stopCamera();
+
+  pendingRaw = raw;
+
+  $('result').value = raw;
+  $('fallback').style.display = 'block';
+
+  if (navigator.vibrate) {
+    navigator.vibrate(100);
+  }
+
+  sendResult();
+}
+
+function scanFrame() {
+  if (!running) {
+    return;
+  }
+
+  try {
+    if (
+      video.readyState >= 2 &&
+      video.videoWidth > 0 &&
+      video.videoHeight > 0
+    ) {
+      // 輪流搜尋中央、左側、整張、下半部。
+      const regions = [
+        [0.15, 0.15, 0.7, 0.7],
+        [0, 0, 0.65, 1],
+        [0, 0, 1, 1],
+        [0, 0.35, 1, 0.65]
+      ];
+
+      const region = regions[
+        attempt % regions.length
+      ];
+
+      attempt++;
+
+      const result = decodeRegion(region);
+
+      if (result) {
+        if (isInvoiceQR(result.data)) {
+          found(result.data);
+          return;
+        }
+
+        if (result.data.startsWith('**')) {
+          show(
+            '目前讀到右側 QR，請將左側 QR 移到中央。'
+          );
+        } else {
+          show(
+            '請對準台灣電子發票的左側 QR。'
+          );
+        }
+      }
+    }
+  } catch (error) {
+    stopCamera();
+    show('辨識中斷：' + error.message);
+    return;
+  }
+
+  timer = setTimeout(scanFrame, 180);
+}
+
+$('start').onclick = async function () {
+  if (running || starting) {
+    return;
+  }
+
+  if (!validParent() || !token) {
+    show(
+      '請從 Apps Script「發票掃描系統」的即時掃描按鈕進入。'
+    );
+
+    return;
+  }
+
+  if (typeof jsQR !== 'function') {
+    show(
+      'QR 程式載入失敗，請確認網路並重新整理。'
+    );
+
+    return;
+  }
+
+  if (!navigator.mediaDevices?.getUserMedia) {
+    show(
+      '請使用 HTTPS 網址，並以 Safari 或 Chrome 開啟。'
+    );
+
+    return;
+  }
+
+  clearTimeout(ackTimer);
+
+  pendingRaw = '';
+
+  $('fallback').style.display = 'none';
+  $('result').value = '';
+
+  starting = true;
+  $('start').disabled = true;
+
+  const currentSession = ++session;
+
+  try {
+    show(
+      '正在開啟後鏡頭，請允許相機權限……'
+    );
+
+    const acquired =
+      await navigator.mediaDevices.getUserMedia({
+        audio: false,
+
+        video: {
+          facingMode: {
+            ideal: 'environment'
+          },
+
+          width: {
+            ideal: 1920
+          },
+
+          height: {
+            ideal: 1080
+          }
+        }
+      });
+
+    if (
+      currentSession !== session ||
+      document.hidden
+    ) {
+      acquired.getTracks().forEach(track => {
+        track.stop();
+      });
+
+      show('請回到此頁，再按「開啟後鏡頭」。');
+
+      return;
+    }
+
+    stream = acquired;
+    video.srcObject = stream;
+
+    await video.play();
+
+    if (
+      currentSession !== session ||
+      document.hidden
+    ) {
+      stopCamera();
+      return;
+    }
+
+    running = true;
+    attempt = 0;
+
+    $('stop').disabled = false;
+
+    show(
+      '將左側 QR 對準中央，讀取成功後會自動停止。'
+    );
+
+    scanFrame();
+  } catch (error) {
+    stopCamera();
+
+    const messages = {
+      NotAllowedError:
+        '相機權限未獲允許，請在瀏覽器網站設定允許相機。',
+
+      NotFoundError:
+        '找不到可使用的相機。',
+
+      NotReadableError:
+        '相機無法使用，請先關閉其他使用相機的 App。'
+    };
+
+    show(
+      messages[error.name] ||
+      '開啟相機失敗：' + error.message
+    );
+  } finally {
+    starting = false;
+    $('start').disabled = running;
+  }
+};
+
+$('stop').onclick = function () {
+  stopCamera();
+  show('相機已停止，可重新開啟。');
+};
+
+$('resend').onclick = sendResult;
+
+$('copy').onclick = async function () {
+  if (!pendingRaw) {
+    return;
+  }
+
+  try {
+    await navigator.clipboard.writeText(
+      pendingRaw
+    );
+
+    show(
+      '已複製！回原頁的「貼上 QR 原始文字」貼上解析。'
+    );
+  } catch (error) {
+    $('result').focus();
+    $('result').select();
+
+    show('請長按上方文字並選擇複製。');
+  }
+};
+
+window.addEventListener('message', function (event) {
+  if (
+    event.origin !== parentOrigin ||
+    event.source !== window.opener ||
+    event.data?.type !== 'INVOICE_QR_RECEIVED' ||
+    event.data?.token !== token ||
+    !pendingRaw
+  ) {
+    return;
+  }
+
+  clearTimeout(ackTimer);
+
+  show(
+    '資料已回填，請切回原分頁確認並儲存。'
+  );
+
+  try {
+    window.opener.focus();
+  } catch (error) {
+    // 手機可能需要手動切回。
+  }
+
+  window.close();
+});
+
+document.addEventListener(
+  'visibilitychange',
+  function () {
+    if (document.hidden) {
+      stopCamera();
+    }
+  }
+);
+
+window.addEventListener('pagehide', function () {
+  stopCamera();
+  clearTimeout(ackTimer);
+});
+</script>
+</body>
+</html>
